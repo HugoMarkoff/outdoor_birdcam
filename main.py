@@ -1,200 +1,292 @@
 #!/usr/bin/env python3
 """
-Garden-cam with:
-• PIR polled at 10 Hz
-• 30 s fixed cooldown between captures
-• trigger_type=1 (PIR) numeric
-• RPI_ALWAYS_ON flag for continuous vs. boot-snap modes
+Garden-Cam Python side · refactored
+  • PIR polled at 10 Hz with high/low logging
+  • 30 s cooldown between captures
+  • boot-snap vs continuous modes via CLI
+  • better error handling, optional spidev/smbus
+  • logging instead of print
 """
-# ── FAST SNAP for boot-snap mode ───────────────────────────────────────────────
-import os, subprocess, datetime, time, sys
+import os
+import sys
+import json
+import re
+import time
+import signal
+import argparse
+import subprocess
+import logging
 from pathlib import Path
+import datetime as dt
 
-RPI_ALWAYS_ON = True               # False = boot-snap-exit mode
-TIME_ZONE     = "Europe/Copenhagen"
-IMG_DIR       = Path(__file__).parent.resolve() / "images"
+# Optional hardware libraries
+try:
+    import RPi.GPIO as GPIO
+except ImportError:
+    GPIO = None
+
+try:
+    import spidev
+except ImportError:
+    spidev = None
+
+try:
+    import smbus2
+    SMBus = smbus2.SMBus
+except ImportError:
+    smbus2 = None
+    SMBus = None
+
+try:
+    from pytz import timezone
+except ImportError:
+    timezone = None
+
+try:
+    from firebase_admin import credentials, initialize_app, storage, firestore
+except ImportError:
+    credentials = initialize_app = storage = firestore = None
+
+# ── Constants ────────────────────────────────────────────────────────────────
+TIME_ZONE           = "Europe/Copenhagen"
+IMG_DIR             = Path(__file__).parent.resolve() / "images"
+PIR_PIN             = 17
+SPI_BUS, SPI_DEV    = 0, 0
+SPI_CMD_BATT        = [0xA5]
+I2C_ADDR            = 0x08
+CMD_REQUEST_SHUTDOWN= 0x07
+DETECTION_INTERVAL  = 10
+BASE_DIR            = Path(__file__).parent.resolve()
+CRED_FILE           = BASE_DIR / "trapapp-credentials.json"
+ID_FILE             = Path.home() / ".id.json"
+
+# ── Helpers ─────────────────────────────────────────────────────────────────
+def setup_logging():
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
+
+def load_trap_id():
+    try:
+        data = ID_FILE.read_text()
+        return json.loads(data).get("TRAPID")
+    except Exception as e:
+        logging.error(f"Could not load TRAPID from {ID_FILE}: {e}")
+        sys.exit(1)
+
+
+def fetch_config(db, trap_id):
+    try:
+        trap_doc = db.collection("traps").document(trap_id).get()
+        if not trap_doc.exists:
+            return {}
+        owner = trap_doc.to_dict().get("owner")
+        user_doc = (
+            db.collection("users").document(owner)
+              .collection("traps").document(trap_id)
+              .get()
+        )
+        return user_doc.to_dict().get("config", {}) if user_doc.exists else {}
+    except Exception as e:
+        logging.warning(f"Error fetching config: {e}")
+        return {}
+
+
+def parse_time(s: str) -> dt.time:
+    try:
+        hh, mm, ss = map(int, s.split(":"))
+        return dt.time(hh, mm, ss)
+    except Exception:
+        return dt.time(0, 0, 0)
+
+
+def in_ignore_window(now: dt.datetime, start: dt.time, end: dt.time) -> bool:
+    if start == end:
+        return False
+    t = now.time()
+    if start < end:
+        return start <= t < end
+    return t >= start or t < end
+
 
 def early_snap() -> Path:
-    """Capture one image ASAP on boot."""
-    IMG_DIR.mkdir(exist_ok=True)
-    fn = IMG_DIR / datetime.datetime.now().strftime("%Y%m%d_%H%M%S.jpg")
+    IMG_DIR.mkdir(parents=True, exist_ok=True)
+    filename = dt.datetime.now().strftime("%Y%m%d_%H%M%S.jpg")
+    path = IMG_DIR / filename
     cmd = [
-        "libcamera-still","-n","-t","800",
-        "--width","1920","--height","1080",
-        "--encoding","jpg","-o",str(fn)
+        "libcamera-still", "-n", "-t", "800",
+        "--width", "1920", "--height", "1080",
+        "--encoding", "jpg", "-o", str(path)
     ]
-    if subprocess.run(cmd, capture_output=True).returncode:
-        print("Early camera capture failed")
+    res = subprocess.run(cmd, capture_output=True)
+    if res.returncode != 0:
+        logging.error(f"Camera capture failed: {res.stderr.decode().strip()}")
         sys.exit(1)
-    return fn
+    return path
 
-if not RPI_ALWAYS_ON:
-    FIRST_IMAGE = early_snap()
-else:
-    FIRST_IMAGE = None
 
-# ── SLOW IMPORTS ───────────────────────────────────────────────────────────────
-import json, re, signal, datetime as dt
-import RPi.GPIO as GPIO, spidev, smbus2
-from pytz import timezone
-from firebase_admin import credentials, initialize_app, storage, firestore
-
-# ── CONSTANTS & SETUP ──────────────────────────────────────────────────────────
-PIR_PIN            = 17
-SPI_BUS, SPI_DEV   = 0, 0
-SPI_CMD_BATT       = [0xA5]
-I2C_ADDR           = 0x08
-CMD_REQUEST_SHUTDOWN = 0x07
-
-BASE_DIR    = Path(__file__).parent.resolve()
-CRED_FILE   = BASE_DIR / "trapapp-credentials.json"
-ID_FILE     = Path.home() / ".id.json"
-DETECTION_INTERVAL = 30     # fixed 30 s between captures
-
-# Firestore init
-cred = credentials.Certificate(str(CRED_FILE))
-initialize_app(cred, {"storageBucket": "trapapp-2f398.appspot.com"})
-db, bucket = firestore.client(), storage.bucket()
-TRAP_ID = json.loads(ID_FILE.read_text())["TRAPID"]
-
-# Pull config for ignore window (still respected)
-def fetch_config():
-    t = db.collection("traps").document(TRAP_ID).get()
-    if not t.exists: return {}
-    owner = t.to_dict()["owner"]
-    u = (db.collection("users").document(owner)
-          .collection("traps").document(TRAP_ID).get())
-    return u.to_dict().get("config", {}) if u.exists else {}
-cfg = fetch_config()
-
-def parse_time(s):
-    h, m, s = map(int, s.split(":"))
-    return dt.time(h, m, s)
-
-ignore_from = parse_time(cfg.get("IgnoreTimeFrom", "00:00:00"))
-ignore_to   = parse_time(cfg.get("IgnoreTimeTo",   "00:00:00"))
-
-# GPIO / SPI / I2C setup
-GPIO.setmode(GPIO.BCM)
-GPIO.setup(PIR_PIN, GPIO.IN, pull_up_down=GPIO.PUD_DOWN)
-
-try:
-    spi = spidev.SpiDev()
-    spi.open(SPI_BUS, SPI_DEV)
-    spi.max_speed_hz = 500_000
-except FileNotFoundError:
-    spi = None
-
-try:
-    bus = smbus2.SMBus(1)
-except FileNotFoundError:
-    bus = None
-
-def cleanup(*_):
-    GPIO.cleanup()
-    if spi: spi.close()
-    if bus: bus.close()
-    sys.exit(0)
-
-signal.signal(signal.SIGINT, cleanup)
-signal.signal(signal.SIGTERM, cleanup)
-
-# ── HELPERS ───────────────────────────────────────────────────────────────────
-def read_battery():
-    if not spi: return 69
+def read_battery(spi_dev) -> int:
+    if not spi_dev:
+        return 0
     try:
-        resp = spi.xfer2(SPI_CMD_BATT + [0])
+        resp = spi_dev.xfer2(SPI_CMD_BATT + [0])
         return max(0, min(100, resp[1]))
-    except:
-        return 69
+    except Exception as e:
+        logging.warning(f"Battery read failed: {e}")
+        return 0
 
-def read_wifi():
+
+def read_wifi_signal() -> int:
     try:
         out = subprocess.check_output(
             ["iw", "dev", "wlan0", "link"],
             text=True, stderr=subprocess.DEVNULL
         )
-        m = re.search(r"signal:\s*(-\d+) dBm", out)
+        m = re.search(r"signal:\s*(-\d+)\s*dBm", out)
         dbm = int(m.group(1)) if m else -90
         return max(0, min(100, round((dbm + 90) * 100 / 60)))
-    except:
+    except Exception:
         return 0
 
-def in_ignore_window(now):
-    if ignore_from == ignore_to:
-        return False
-    t = now.time()
-    if ignore_from < ignore_to:
-        return ignore_from <= t < ignore_to
-    return t >= ignore_from or t < ignore_to
 
-def capture_image():
-    """Use libcamera-still for capture."""
-    path = early_snap()  # same function works
-    return path
-
-def upload_to_firebase(img_path, batt, sig):
-    now = dt.datetime.now(timezone(TIME_ZONE))
+def upload_to_firebase(db, bucket, trap_id, img_path, batt, sig):
+    now = dt.datetime.now(timezone(TIME_ZONE)) if timezone else dt.datetime.utcnow()
     data = {
         "server_ts": now,
-        "trap_id": TRAP_ID,
+        "trap_id": trap_id,
         "battery_charge": batt,
         "signal_strength": sig,
-        "trigger_type": 1     # numeric PIR
+        "trigger_type": 1,
     }
-    ref = db.collection("imageInbox").document()
-    ref.set(data)
-    iid = ref.id
-
-    blob = bucket.blob(f"images/{iid}/{img_path.name}")
+    doc_ref = db.collection("imageInbox").document()
+    doc_ref.set(data)
+    blob = bucket.blob(f"images/{doc_ref.id}/{img_path.name}")
     blob.upload_from_filename(str(img_path))
     blob.make_public()
-    ref.update({"url": blob.public_url})
-
+    doc_ref.update({"url": blob.public_url})
     img_path.unlink()
-    print(f"✓ uploaded {img_path.name} | batt={batt}% sig={sig}%")
+    logging.info(f"Uploaded {img_path.name} batt={batt}% sig={sig}%")
 
-def send_shutdown():
-    if bus:
-        try:
-            bus.write_byte(I2C_ADDR, CMD_REQUEST_SHUTDOWN)
-        except Exception as e:
-            print("I2C shutdown failed:", e)
 
-# ── MODES ────────────────────────────────────────────────────────────────────
-def continuous_mode():
+def send_shutdown(bus_dev):
+    if not bus_dev:
+        return
+    try:
+        bus_dev.write_byte(I2C_ADDR, CMD_REQUEST_SHUTDOWN)
+        logging.info("Shutdown command sent via I2C")
+    except Exception as e:
+        logging.warning(f"Shutdown via I2C failed: {e}")
+
+
+def cleanup(spi_dev, bus_dev):
+    if GPIO:
+        GPIO.cleanup()
+    if spi_dev:
+        spi_dev.close()
+    if bus_dev:
+        bus_dev.close()
+    logging.info("Cleanup complete, exiting.")
+    sys.exit(0)
+
+# ── Modes ───────────────────────────────────────────────────────────────────
+def continuous_mode(spi_dev, bus_dev, cfg):
+    start = parse_time(cfg.get("IgnoreTimeFrom", "00:00:00"))
+    end   = parse_time(cfg.get("IgnoreTimeTo",   "00:00:00"))
     last_shot = 0.0
-    print("Garden-cam armed (always-on)…")
+    last_pir = False
+    logging.info("Entering continuous mode.")
     while True:
-        now_ts = time.time()
-        now_dt = dt.datetime.now(timezone(TIME_ZONE))
-
-        if in_ignore_window(now_dt):
+        now = dt.datetime.now(timezone(TIME_ZONE)) if timezone else dt.datetime.utcnow()
+        if in_ignore_window(now, start, end):
             time.sleep(1)
             continue
+        current_pir = GPIO.input(PIR_PIN) if GPIO else False
+        if current_pir != last_pir:
+            state = "HIGH" if current_pir else "LOW"
+            logging.info(f"PIR {state}")
+            last_pir = current_pir
+        if current_pir:
+            if time.time() - last_shot >= DETECTION_INTERVAL:
+                last_shot = time.time()
+                img = early_snap()
+                batt = read_battery(spi_dev)
+                sig  = read_wifi_signal()
+                upload_to_firebase(db, bucket, TRAP_ID, img, batt, sig)
+        time.sleep(0.1)
 
-        if GPIO.input(PIR_PIN) and (now_ts - last_shot) >= DETECTION_INTERVAL:
-            last_shot = now_ts
-            try:
-                upload_to_firebase(capture_image(), read_battery(), read_wifi())
-            except Exception as e:
-                print("ERROR during upload:", e)
 
-        time.sleep(0.1)   # poll PIR at 10 Hz
+def boot_snap_mode(spi_dev, bus_dev):
+    logging.info("Entering boot-snap mode.")
+    img = early_snap()
+    batt = read_battery(spi_dev)
+    sig  = read_wifi_signal()
+    upload_to_firebase(db, bucket, TRAP_ID, img, batt, sig)
+    send_shutdown(bus_dev)
+    cleanup(spi_dev, bus_dev)
 
-def boot_snap_mode():
-    print("Boot-snap mode: capturing one image…")
-    try:
-        upload_to_firebase(FIRST_IMAGE, read_battery(), read_wifi())
-    except Exception as e:
-        print("ERROR during boot-snap:", e)
-    send_shutdown()
-    print("Shutdown command sent; exiting.")
-    cleanup()
-
-# ── ENTRY POINT ───────────────────────────────────────────────────────────────
+# ── Entry Point ─────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    if RPI_ALWAYS_ON:
-        continuous_mode()
+    setup_logging()
+    parser = argparse.ArgumentParser(description="Garden-Cam control script")
+    parser.add_argument(
+        "--boot-snap", action="store_true",
+        help="Capture once on boot then shut down"
+    )
+    args = parser.parse_args()
+
+    TRAP_ID = load_trap_id()
+
+    # GPIO setup
+    if GPIO:
+        GPIO.setmode(GPIO.BCM)
+        GPIO.setup(PIR_PIN, GPIO.IN, pull_up_down=GPIO.PUD_DOWN)
+
+    # SPI init
+    spi_dev = None
+    if spidev:
+        try:
+            spi_dev = spidev.SpiDev()
+            spi_dev.open(SPI_BUS, SPI_DEV)
+            spi_dev.max_speed_hz = 500_000
+        except Exception as e:
+            logging.warning(f"SPI init failed: {e}")
+            spi_dev = None
+
+    # I2C init
+    bus_dev = None
+    if SMBus:
+        try:
+            bus_dev = SMBus(1)
+        except Exception as e:
+            logging.warning(f"I2C init failed: {e}")
+            bus_dev = None
+
+    # Firebase init
+    if credentials and initialize_app and firestore and storage:
+        try:
+            cred = credentials.Certificate(str(CRED_FILE))
+            initialize_app(cred, {"storageBucket": "trapapp-2f398.appspot.com"})
+            db     = firestore.client()
+            bucket = storage.bucket()
+        except Exception as e:
+            logging.error(f"Firebase init failed: {e}")
+            sys.exit(1)
     else:
-        boot_snap_mode()
+        logging.error("Missing Firebase libraries.")
+        sys.exit(1)
+
+    # Config fetch
+    cfg = fetch_config(db, TRAP_ID)
+
+    # Signal handlers
+    signal.signal(signal.SIGINT, lambda *_: cleanup(spi_dev, bus_dev))
+    signal.signal(signal.SIGTERM, lambda *_: cleanup(spi_dev, bus_dev))
+
+    # Run selected mode
+    if args.boot_snap:
+        boot_snap_mode(spi_dev, bus_dev)
+    else:
+        continuous_mode(spi_dev, bus_dev, cfg)
